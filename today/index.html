@@ -215,6 +215,51 @@
 
   .empty-tip { padding: 28px 0; text-align: center; color: var(--muted); font-size: 14px; }
 
+  /* ---------- 同步 + rejected ---------- */
+  .sync-row {
+    padding: 12px 16px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .sync-btn {
+    width: 100%;
+    padding: 11px;
+    border-radius: 12px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    font-weight: 600;
+    text-align: left;
+  }
+  .sync-btn:active { background: var(--line); }
+  .sync-btn strong { color: var(--bad); font-weight: 700; }
+
+  .rejected-list {
+    padding: 8px 0 0;
+    border-top: 1px dashed var(--line);
+    margin-top: 4px;
+  }
+  /* 视觉降级：不只颜色，距离也要区分，让用户下意识知道这是过去时 */
+  .rejected-list .item {
+    opacity: .6;
+    letter-spacing: .5px;
+    padding: 10px 0;
+  }
+  .rejected-list .item-name {
+    color: var(--muted);
+    pointer-events: none;
+  }
+  .rejected-list .del { display: none; }
+  .rejected-list .restore {
+    margin-left: auto;
+    color: var(--accent);
+    font-size: 13px;
+    padding: 4px 10px;
+    border-radius: 8px;
+  }
+  .rejected-list .restore:active { background: var(--line); }
+
   .sheet-foot { padding: 14px 16px max(16px, env(safe-area-inset-bottom)); }
   .danger {
     width: 100%;
@@ -300,12 +345,14 @@
 
   /**
    * version 在 v1 里只写不读，这是故意的：它的价值在于**未来**。
-   * 一旦 v2 需要改数据结构，磁盘上的老数据必须能被认出来才谈得上迁移；
-   * v1 不写这个字段的话，v2 就只能靠猜结构来判断版本。
-   * v1 本身没有可迁移的历史版本，所以现在读它无事可做。
+   * v2 用上了：磁盘上的 v1 数据（item 只有 name/weight）现在被识别为旧版，
+   * sanitize 显式补 rejected/rejectedAt 字段，写回时升级到 v2。
+   *
+   * STORE_KEY 故意保留 'what-today.v1'（历史命名，不与 version 字段混淆），
+   * 用户的旧数据靠版本字段识别，不靠 key 名。
    */
   function emptyState() {
-    return { version: 1, active: 'food', food: [], movie: [] };
+    return { version: 2, active: 'food', food: [], movie: [] };
   }
 
   /** 把任意来源的数据洗成可信结构，脏字段直接丢弃而不是让后续逻辑崩 */
@@ -326,16 +373,32 @@
         if (!name || seen.has(name)) continue;
         seen.add(name);
         const weight = Number(item.weight);
-        state[list].push({
+        // 走 normalizeItem 归一化字段，不内联 —— 加新字段时只改 normalizeItem 一处。
+        state[list].push(normalizeItem({
           name,
-          weight: Number.isFinite(weight) ? clamp(Math.round(weight), 1, MAX_WEIGHT) : 1
-        });
+          weight,
+          rejected: item.rejected,
+          rejectedAt: item.rejectedAt
+        }));
       }
     }
     return state;
   }
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+  /**
+   * 把任意来源的 item 部分归一化成完整形态。
+   * 所有修改 state 的入口（onAdd / sanitize / merge）都走这条，避免落盘形态不一致。
+   */
+  function normalizeItem(p) {
+    return {
+      name: String(p.name).trim().slice(0, MAX_NAME_LEN),
+      weight: Number.isFinite(p.weight) ? clamp(Math.round(p.weight), 1, MAX_WEIGHT) : 1,
+      rejected: p.rejected === true,
+      rejectedAt: Number.isFinite(p.rejectedAt) ? Math.max(0, p.rejectedAt) : 0
+    };
+  }
 
   /** 读原始字符串；存储被禁用时当作「没有数据」 */
   function readStoredText() {
@@ -390,6 +453,101 @@
     }
   }
 
+  /* ============ 同步：deflate + URL-safe base64 + merge ============ */
+
+  /**
+   * 把字符串压成字节数组。
+   * CompressionStream 是异步流式 API（不是 callback 风格），用 Blob + Response 把它拍平成一次性 await。
+   * 封小工具后所有流式调用都省事：await deflate(JSON.stringify(state))
+   */
+  async function deflate(str) {
+    const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('deflate'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  async function inflate(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+  }
+
+  /**
+   * URL-safe base64：标准 base64 把 `+` `/` `=` 用于 URL 时容易触发百分号编码，
+   * 改用 `-` `_` 替换前两个，`=` padding 在 URL fragment 里完全合法（保留）。
+   *
+   * 用 `btoa` / `atob` 处理 **二进制字符串**（每字节一字符），再字符替换。
+   * 不直接用 base64 算法重写 —— 不增加代码量，标准工具足够。
+   */
+  function b64UrlEncode(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_');
+  }
+
+  function b64UrlDecode(s) {
+    const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  /** 把 state 编码成可塞进 URL hash 的字符串。返回 null 表示编码失败（极端情况，几乎不会发生） */
+  async function encodeState(state) {
+    try {
+      const json = JSON.stringify(state);
+      const compressed = await deflate(json);
+      return '#d=' + b64UrlEncode(compressed);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 从 hash 字符串解码回 state；任何环节失败都返回 null（不抛给 UI） */
+  async function decodeState(hash) {
+    if (!hash || !hash.startsWith('#d=')) return null;
+    try {
+      const compressed = b64UrlDecode(hash.slice(3));
+      const json = await inflate(compressed);
+      // 防御：解码出来的字符串要能被 JSON.parse 接住
+      JSON.parse(json);
+      return json;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 合并两份 state。语义：weight=max, rejected=OR, rejectedAt=max。
+   *
+   * 入参约定：incoming 必须已经 sanitize。
+   * - 新 item 路径走 normalizeItem 纵深防御（即使 incoming 不干净也会归一化）
+   * - cur 路径直接修改字段（Math.max / || / Math.max），依赖 sanitize 保证字段类型
+   *
+   * 防御：incoming 的 list 字段可能缺失或非数组（恶意链接 / 半损坏），
+   * 用 Array.isArray 兜底，避免 TypeError。
+   */
+  function mergeStates(current, incoming) {
+    const result = { ...current };
+    for (const list of LISTS) {
+      const merged = new Map();
+      for (const item of result[list]) merged.set(item.name, { ...item });
+      const incomingItems = Array.isArray(incoming[list]) ? incoming[list] : [];
+      for (const inc of incomingItems) {
+        const cur = merged.get(inc.name);
+        if (!cur) {
+          // 走 normalizeItem 纵深防御：incoming 已 sanitize 过，但 normalizeItem 会
+          // 把任何 undefined 字段补成默认值（{ ...inc } 会复制 undefined，落盘形态退化）
+          merged.set(inc.name, normalizeItem(inc));
+        } else {
+          cur.weight = Math.max(cur.weight ?? 1, inc.weight ?? 1);
+          cur.rejected = cur.rejected || inc.rejected || false;
+          cur.rejectedAt = Math.max(cur.rejectedAt ?? 0, inc.rejectedAt ?? 0);
+        }
+      }
+      result[list] = Array.from(merged.values());
+    }
+    return result;
+  }
+
   /* ============ 抽取：加权随机 ============ */
 
   /** 在完整候选集上按 weight 做一次加权抽取 */
@@ -435,12 +593,19 @@
   };
 
   const activeItems = () => state[state.active];
+  /**
+   * 可被抽取的池子 —— 剔除 👎 掉的项。
+   * pick() 之前必须经过这层过滤；rejected 是"过去时"，永远不该被抽中。
+   * weight 保留：👎 表达的是"不想吃"，不是"评错了"，恢复后偏好仍在。
+   */
+  const activePool = () => activeItems().filter(i => !i.rejected);
 
   /* ============ 主屏渲染 ============ */
 
   function renderStage() {
     const items = activeItems();
-    const empty = items.length === 0;
+    const pool = activePool();
+    const empty = pool.length === 0;
 
     el.rollBtn.disabled = empty;
     el.rollBtn.textContent = current ? '再来一个' : '随机一个';
@@ -458,12 +623,12 @@
     } else if (current) {
       el.hint.textContent = '吃完 / 看完再打分';
     } else {
-      el.hint.textContent = `${LIST_LABEL[state.active]}清单里有 ${items.length} 个候选`;
+      el.hint.textContent = `${LIST_LABEL[state.active]}清单里有 ${pool.length} 个候选`;
     }
   }
 
   function roll() {
-    const chosen = pick(activeItems(), current?.name);
+    const chosen = pick(activePool(), current?.name);
     if (!chosen) return;
     current = chosen;
     // 重放入场动画：换个节点让 CSS animation 重新触发
@@ -483,8 +648,13 @@
         items[index].weight = clamp(items[index].weight + 1, 1, MAX_WEIGHT);
         toast(`👍 以后多给你「${items[index].name}」`);
       } else if (verdict === 'down') {
-        const [removed] = items.splice(index, 1);
-        toast(`👎 已把「${removed.name}」移出清单`);
+        // 👎 不真删，标 rejected 留数据里 —— A1 tombstone。
+        // 理由：① 多端合并时拒绝状态是 OR，删除会被复活（最严重的失败模式）；
+        //      ② rejected 是产品资产，未来想统计"我曾拒过什么"是金矿；
+        //      ③ 恢复（restoreItem）是用户唯一反向操作，weight 保留 = 偏好地位恢复。
+        items[index].rejected = true;
+        items[index].rejectedAt = Date.now();
+        toast(`👎 已把「${items[index].name}」标记为不想吃`);
       }
     }
 
@@ -518,6 +688,9 @@
   /* ============ 二级菜单（清单管理） ============ */
 
   let sheet = null;
+  /** rejected 分组的展开状态：跨 sheet 会话持久 —— 用户偏好"始终看"或"始终折叠"
+   * 是合理的产品决策，不主动重置；想改就再点一次开关。 */
+  let showRejected = false;
 
   function openSheet() {
     if (sheet) return;
@@ -542,6 +715,12 @@
           <button type="submit">➕</button>
         </form>
         <div class="items"></div>
+        <div class="sync-row">
+          <button class="sync-btn" data-act="export-link"
+                  aria-label="生成本设备的同步链接">生成本设备的同步链接（含你的清单，<strong>仅发给自己</strong>）</button>
+          <button class="sync-btn" data-act="import-link">导入同步链接</button>
+          <button class="sync-btn" data-act="toggle-rejected" hidden>显示已 👎 的 0 项</button>
+        </div>
         <div class="sheet-foot">
           <button class="danger" data-act="clear">清空所有数据</button>
         </div>
@@ -564,12 +743,18 @@
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'close') return closeSheet();
     if (act === 'clear') return clearAll();
+    if (act === 'export-link') return exportLink();
+    if (act === 'import-link') return importLink();
+    if (act === 'toggle-rejected') return toggleRejected();
 
     const tab = e.target.closest('.tab');
     if (tab) return switchList(tab.dataset.list);
 
     const del = e.target.closest('.del');
     if (del) removeItem(Number(del.dataset.i));
+
+    const restore = e.target.closest('.restore');
+    if (restore) restoreItem(Number(restore.dataset.i));
   }
 
   function onAdd(e) {
@@ -584,7 +769,7 @@
     } else if (items.some(i => i.name === name)) {
       toast('已经有这个了');
     } else {
-      items.push({ name, weight: 1 });
+      items.push(normalizeItem({ name }));
       save();
       renderStage();
       renderSheet();
@@ -600,6 +785,106 @@
     items.splice(index, 1);
     save();
     renderStage();
+    renderSheet();
+  }
+
+  /**
+   * 恢复被 👎 的 item —— 取消 rejected 标记，weight 保留。
+   * 理由：👎 表达的是"不想吃"，不是"评错了"，之前 👍 过说明确实喜欢。
+   * 不要重置 weight，否则恢复 = 强制重新评价，违背最小惊讶。
+   * 这一点必须写在这里（cc_cr Q3），否则下个 reviewer 会问"为啥不 reset weight"。
+   */
+  function restoreItem(index) {
+    const items = activeItems();
+    const item = items[index];
+    if (!item || !item.rejected) return;
+    item.rejected = false;
+    item.rejectedAt = 0;
+    // weight 故意不动（见上方注释）
+    save();
+    renderStage();
+    renderSheet();
+    toast(`已恢复「${item.name}」`);
+  }
+
+  /* ============ 同步：URL-hash 导出 / 导入 ============ */
+
+  /**
+   * 把 state 编码成 URL 链接并复制到剪贴板。
+   * 链接里 #d= 是数据前缀（与可能的 view-state 等其它用途区分）。
+   * 链接较长时提示 JSON fallback —— 但 v1.5 不做 JSON，提示留给未来。
+   */
+  async function exportLink() {
+    const hash = await encodeState(state);
+    if (!hash) { toast('编码失败'); return; }
+    const url = location.origin + location.pathname + hash;
+    const kb = (url.length / 1024).toFixed(1);
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(url);
+      copied = true;
+    } catch {
+      // 剪贴板 API 在非安全上下文（file://, http://）或被禁用时会失败 → fallback 到 prompt
+    }
+    if (copied) {
+      toast(`链接已复制（${kb} KB），去微信发给自己`);
+    } else {
+      prompt('复制下面这段链接（已选中整段），去微信发给自己：', url);
+    }
+  }
+
+  /**
+   * 从用户粘贴的链接里解码并合并。
+   * 流程：decode → sanitize → 二次确认（仅在有新名字时）→ merge → save → 关 sheet。
+   *
+   * X=0 时（重复导入 / 链接等于自己）跳过确认 + 显示「已是最新」，
+   * 但**仍然执行 merge**：rejected 状态变化 / weight max 等"无新名字但有状态变化"
+   * 的情况也算更新。直接 return 会让 A 端的 👎 状态在 B 端失效 —— 违反 A1 tombstone。
+   */
+  async function importLink() {
+    const raw = prompt(
+      '粘贴同步链接（直接粘贴，不要编辑）：\n\n' +
+      '链接含你的全部清单，**仅在自己设备之间使用**。'
+    );
+    if (!raw) return;
+    const hash = raw.includes('#') ? raw.slice(raw.indexOf('#')) : raw;
+    const json = await decodeState(hash);
+    if (!json) { toast('链接坏掉了'); return; }
+    const incoming = sanitize(JSON.parse(json));
+
+    const merged = mergeStates(state, incoming);
+    const totalNew = countNewItems(state, merged);
+
+    if (totalNew > 0) {
+      const curTotal = state.food.length + state.movie.length;
+      if (!confirm(`将合并 ${totalNew} 项（你已有 ${curTotal} 项），是否继续？`)) return;
+    }
+
+    Object.assign(state, merged);
+    save();
+    renderStage();
+    renderSheet();
+
+    if (totalNew === 0) {
+      toast('已是最新');
+    } else {
+      closeSheet();
+      toast(`已合并 ${totalNew} 项`);
+    }
+  }
+
+  /** 计算合并后新增的 item 数（用于决定要不要弹确认） */
+  function countNewItems(before, after) {
+    let n = 0;
+    for (const list of LISTS) {
+      const seen = new Set(before[list].map(i => i.name));
+      for (const item of after[list]) if (!seen.has(item.name)) n++;
+    }
+    return n;
+  }
+
+  function toggleRejected() {
+    showRejected = !showRejected;
     renderSheet();
   }
 
@@ -659,22 +944,61 @@
     const box = sheet.querySelector('.items');
     if (items.length === 0) {
       box.innerHTML = '<div class="empty-tip">还没有候选，上面加一个吧</div>';
+      syncRowUpdate(0);
       return;
     }
 
-    box.innerHTML = items.map((item, i) => `
+    // 渲染 active pool + 可选的 rejected 折叠列表
+    // rejected item 走原始 index（data-i），保证 restoreItem / renameItem 索引一致
+    const activeHtml = items.map((item, i) => {
+      if (item.rejected) return '';
+      return `
       <div class="item">
         <input class="item-name" type="text" maxlength="${MAX_NAME_LEN}" data-i="${i}"
                value="${escapeHtml(item.name)}" aria-label="编辑候选名称" enterkeyhint="done">
         ${item.weight > 1 ? `<span class="weight">👍×${item.weight - 1}</span>` : ''}
         <button class="del" data-i="${i}" aria-label="删除 ${escapeHtml(item.name)}">🗑</button>
-      </div>`).join('');
+      </div>`;
+    }).join('');
+
+    const rejectedCount = items.filter(i => i.rejected).length;
+    let rejectedHtml = '';
+    if (showRejected && rejectedCount > 0) {
+      rejectedHtml = `<div class="rejected-list">${
+        items.map((item, i) => {
+          if (!item.rejected) return '';
+          return `
+            <div class="item">
+              <span class="item-name">👎 ${escapeHtml(item.name)}</span>
+              ${item.weight > 1 ? `<span class="weight">👍×${item.weight - 1}</span>` : ''}
+              <button class="restore" data-i="${i}" aria-label="恢复 ${escapeHtml(item.name)}">恢复</button>
+            </div>`;
+        }).join('')
+      }</div>`;
+    }
+
+    box.innerHTML = activeHtml + rejectedHtml;
 
     for (const node of box.querySelectorAll('.item-name')) {
+      if (!node.matches('input')) continue;     // rejected list 里是 span，没事件
       node.addEventListener('change', () => renameItem(Number(node.dataset.i), node.value));
       node.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); node.blur(); }
       });
+    }
+
+    syncRowUpdate(rejectedCount);
+  }
+
+  /** 更新 sync-row 里 rejected toggle 按钮的可见性和文案 */
+  function syncRowUpdate(rejectedCount) {
+    const toggle = sheet?.querySelector('[data-act="toggle-rejected"]');
+    if (!toggle) return;
+    if (rejectedCount === 0) {
+      toggle.hidden = true;
+    } else {
+      toggle.hidden = false;
+      toggle.textContent = (showRejected ? '隐藏' : '显示') + `已 👎 的 ${rejectedCount} 项`;
     }
   }
 
