@@ -337,11 +337,16 @@
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
+  /** 读原始字符串；存储被禁用时当作「没有数据」 */
+  function readStoredText() {
+    try { return localStorage.getItem(STORE_KEY); } catch { return null; }
+  }
+
   /** 纯读：从 localStorage 取出并洗干净，不产生任何写入 */
   function readState() {
     let raw = null;
     try {
-      raw = JSON.parse(localStorage.getItem(STORE_KEY));
+      raw = JSON.parse(readStoredText());
     } catch {
       // 数据损坏（手改 / 被别的页面写脏）：静默重置，用一次 toast 告知
       queueToast('本地数据读不出来，已重新开始');
@@ -350,15 +355,24 @@
   }
 
   /**
-   * 启动时读取，并把洗干净的结果回写一次。
-   * 回写是为了自愈：不管是「JSON 解析失败」还是「JSON 合法但字段脏」，不回写的话
-   * 脏数据会一直躺在 localStorage 里，用户每次刷新都重新踩一遍、每次都弹一次提示。
-   * 注意回写只能发生在启动路径 —— 放进 readState 的话，跨 tab 同步时
-   * 「A 写 → B 读并回写 → A 收到事件再读再回写」会变成无限乒乓。
+   * 启动时读取，并在磁盘内容「不等于」洗干净的结果时回写一次。
+   *
+   * 回写是为了自愈：不管是 JSON 解析失败还是 JSON 合法但字段脏，不回写的话脏数据
+   * 会一直躺着，用户每次刷新都重新踩一遍、每次都弹一次提示。
+   *
+   * 但必须是**有条件**回写：无条件写的话，本 tab 每次启动都会给其它开着的 tab
+   * 推一次 storage 事件，让它们白跑一轮重渲染。
+   *
+   * 回写也只能发生在启动路径 —— 放进 readState 的话，跨 tab 同步会变成
+   * 「A 写 → B 读并回写 → A 收到事件再读再回写」的无限乒乓。
    */
   function load() {
+    const storedText = readStoredText();
     const clean = readState();
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(clean)); } catch { /* 存储不可用，交给后续 save() 提示 */ }
+    const cleanText = JSON.stringify(clean);
+    if (storedText !== cleanText) {
+      try { localStorage.setItem(STORE_KEY, cleanText); } catch { /* 存储不可用，交给后续 save() 提示 */ }
+    }
     return clean;
   }
 
@@ -683,8 +697,8 @@
   window.addEventListener('storage', e => {
     if (e.key !== STORE_KEY) return;
     const incoming = readState();
-    incoming.active = state.active;   // 当前看的是哪个清单是本 tab 的事，别被对方拽走
-    Object.assign(state, incoming);
+    // 合并对方的清单，但强制保留本 tab 的 active：当前看的是哪个清单是本 tab 的 UI 状态
+    Object.assign(state, incoming, { active: state.active });
     if (current && !activeItems().some(i => i.name === current.name)) current = null;
     renderStage();
     renderSheet();
