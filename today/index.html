@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#fff8f0">
+<!-- 加到手机桌面后全屏打开，去掉地址栏，观感更接近原生 app（纯 meta，不引入额外文件） -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="今天吃什么">
+<title>今天吃/看什么</title>
+<style>
+  :root {
+    --bg: #fff8f0;
+    --ink: #2b2118;
+    --muted: #8a7a6b;
+    --line: #e8dbcc;
+    --accent: #ff6b35;
+    --accent-ink: #fff;
+    --good: #2e9e5b;
+    --meh: #b9911f;
+    --bad: #d64545;
+    --card: #fffdfa;
+    --radius: 16px;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+    /* 横竖屏切换时靠 dvh 跟随可视高度，避免移动端地址栏收起后布局跳动 */
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  button { font: inherit; color: inherit; cursor: pointer; border: none; background: none; }
+
+  /* ---------- 顶栏 ---------- */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: max(12px, env(safe-area-inset-top)) 16px 12px;
+  }
+  .title { font-size: 17px; font-weight: 700; letter-spacing: .5px; }
+  .spacer { flex: 1; }
+
+  .icon-btn {
+    width: 40px; height: 40px;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    font-size: 20px;
+    transition: background .15s;
+  }
+  .icon-btn:active { background: var(--line); }
+
+  /* ---------- tab ---------- */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin: 0 16px;
+    padding: 4px;
+    background: var(--line);
+    border-radius: 999px;
+  }
+  .tab {
+    flex: 1;
+    padding: 9px 0;
+    border-radius: 999px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--muted);
+    transition: background .18s, color .18s;
+  }
+  .tab[aria-selected="true"] { background: var(--card); color: var(--ink); }
+
+  /* ---------- 主流程 ---------- */
+  .stage {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    padding: 24px 20px max(24px, env(safe-area-inset-bottom));
+  }
+
+  .roll-btn {
+    width: min(62vw, 40dvh, 260px);
+    aspect-ratio: 1;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: clamp(22px, 6vw, 30px);
+    font-weight: 800;
+    letter-spacing: 2px;
+    box-shadow: 0 10px 28px rgba(255, 107, 53, .32);
+    transition: transform .12s, box-shadow .12s, opacity .2s;
+  }
+  .roll-btn:active:not(:disabled) { transform: scale(.94); box-shadow: 0 4px 14px rgba(255, 107, 53, .28); }
+  .roll-btn:disabled { background: var(--line); color: var(--muted); box-shadow: none; cursor: not-allowed; }
+
+  .result {
+    min-height: 84px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    text-align: center;
+  }
+  .result-name {
+    font-size: clamp(30px, 9vw, 46px);
+    font-weight: 800;
+    line-height: 1.2;
+    word-break: break-word;
+    animation: pop .28s cubic-bezier(.2, 1.4, .4, 1);
+  }
+  @keyframes pop { from { opacity: 0; transform: scale(.7); } to { opacity: 1; transform: scale(1); } }
+
+  .hint { color: var(--muted); font-size: 14px; }
+
+  .rate-row { display: flex; gap: 14px; }
+  .rate {
+    width: 68px; height: 68px;
+    border-radius: 50%;
+    background: var(--card);
+    border: 2px solid var(--line);
+    font-size: 28px;
+    display: grid; place-items: center;
+    transition: transform .12s, border-color .12s;
+  }
+  .rate:active { transform: scale(.9); }
+  .rate[data-v="up"]:active   { border-color: var(--good); }
+  .rate[data-v="meh"]:active  { border-color: var(--meh); }
+  .rate[data-v="down"]:active { border-color: var(--bad); }
+
+  [hidden] { display: none !important; }
+
+  /* ---------- 二级菜单 ---------- */
+  .sheet-mask {
+    position: fixed; inset: 0;
+    background: rgba(43, 33, 24, .45);
+    display: flex; align-items: flex-end;
+    z-index: 10;
+  }
+  .sheet {
+    width: 100%;
+    max-height: 88dvh;
+    background: var(--bg);
+    border-radius: 20px 20px 0 0;
+    display: flex; flex-direction: column;
+    animation: rise .22s ease-out;
+  }
+  @keyframes rise { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  @media (min-width: 640px) {
+    .sheet-mask { align-items: center; justify-content: center; }
+    .sheet { max-width: 460px; border-radius: 20px; max-height: 80dvh; }
+  }
+
+  .sheet-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 16px 16px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .sheet-title { font-weight: 700; }
+  .count { color: var(--muted); font-size: 13px; }
+
+  .tabs.in-sheet { margin: 12px 16px 0; }
+
+  .adder { display: flex; gap: 8px; padding: 12px 16px; }  .adder input {
+    flex: 1; min-width: 0;
+    padding: 11px 14px;
+    font: inherit;
+    color: var(--ink);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+  }
+  .adder input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .adder button {
+    padding: 0 18px;
+    border-radius: 12px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 700;
+  }
+
+  .items { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 0 16px; }
+  .item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .item-name {
+    flex: 1; min-width: 0;
+    padding: 6px 8px;
+    font: inherit;
+    color: inherit;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+  }
+  .item-name:focus { outline: none; border-color: var(--accent); background: var(--card); }
+  .weight { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .del { padding: 6px 10px; font-size: 17px; color: var(--bad); border-radius: 8px; }
+
+  .empty-tip { padding: 28px 0; text-align: center; color: var(--muted); font-size: 14px; }
+
+  .sheet-foot { padding: 14px 16px max(16px, env(safe-area-inset-bottom)); }
+  .danger {
+    width: 100%;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid var(--bad);
+    color: var(--bad);
+    font-weight: 600;
+  }
+
+  /* ---------- toast ---------- */
+  .toast {
+    position: fixed;
+    left: 50%; bottom: 32px;
+    transform: translateX(-50%);
+    max-width: 88vw;
+    padding: 11px 18px;
+    background: var(--ink);
+    color: #fff;
+    font-size: 14px;
+    border-radius: 999px;
+    z-index: 20;
+    animation: fade .2s;
+  }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <span class="title">今天吃 / 看什么</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="openMenu" aria-label="设置和清单管理">⚙️</button>
+</header>
+
+<div class="tabs" role="tablist" id="tabs">
+  <button class="tab" role="tab" data-list="food"  aria-selected="true">🍜 吃饭</button>
+  <button class="tab" role="tab" data-list="movie" aria-selected="false">🎬 看电影</button>
+</div>
+
+<main class="stage">
+  <button class="roll-btn" id="rollBtn">随机一个</button>
+
+  <div class="result">
+    <div class="result-name" id="resultName" hidden></div>
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <div class="rate-row" id="rateRow" hidden>
+    <button class="rate" data-v="up"   aria-label="好评，以后多推">👍</button>
+    <button class="rate" data-v="meh"  aria-label="一般，保持不变">😐</button>
+    <button class="rate" data-v="down" aria-label="不行，从清单移除">👎</button>
+  </div>
+</main>
+
+<script>
+(() => {
+  'use strict';
+
+  const STORE_KEY = 'what-today.v1';
+  const LISTS = ['food', 'movie'];
+  const LIST_LABEL = { food: '吃饭', movie: '看电影' };
+  /* 权重上限：防止一个item被连点20次👍后垄断抽取，其它候选再也抽不到 */
+  const MAX_WEIGHT = 8;
+  const MAX_NAME_LEN = 40;
+  /* 单个清单条目数上限：正常人不会有 200 个候选，超出的一定是脏数据 */
+  const MAX_ITEMS = 200;
+
+  /* 启动阶段（DOM 逻辑就绪前）产生的提示先攒着，renderStage 之后再弹 */
+  let pendingToast = '';
+  function queueToast(msg) { pendingToast = msg; }
+  function flushPendingToast() {
+    if (!pendingToast) return;
+    toast(pendingToast);
+    pendingToast = '';
+  }
+
+  /* ============ 存储层：任何异常都降级为「空数据 + 提示」，绝不抛到 UI ============ */
+
+  /**
+   * version 在 v1 里只写不读，这是故意的：它的价值在于**未来**。
+   * 一旦 v2 需要改数据结构，磁盘上的老数据必须能被认出来才谈得上迁移；
+   * v1 不写这个字段的话，v2 就只能靠猜结构来判断版本。
+   * v1 本身没有可迁移的历史版本，所以现在读它无事可做。
+   */
+  function emptyState() {
+    return { version: 1, active: 'food', food: [], movie: [] };
+  }
+
+  /** 把任意来源的数据洗成可信结构，脏字段直接丢弃而不是让后续逻辑崩 */
+  function sanitize(raw) {
+    const state = emptyState();
+    if (!raw || typeof raw !== 'object') return state;
+
+    state.active = LISTS.includes(raw.active) ? raw.active : 'food';
+
+    for (const list of LISTS) {
+      const items = Array.isArray(raw[list]) ? raw[list] : [];
+      const seen = new Set();
+      for (const item of items) {
+        // 上限是纵深防御：localStorage 配额本身拦得住正常写入，但被外部写脏时
+        // 一个超大数组会让 JSON.parse + 渲染卡死主线程
+        if (state[list].length >= MAX_ITEMS) break;
+        const name = typeof item?.name === 'string' ? item.name.trim().slice(0, MAX_NAME_LEN) : '';
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        const weight = Number(item.weight);
+        state[list].push({
+          name,
+          weight: Number.isFinite(weight) ? clamp(Math.round(weight), 1, MAX_WEIGHT) : 1
+        });
+      }
+    }
+    return state;
+  }
+
+  function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+  /** 纯读：从 localStorage 取出并洗干净，不产生任何写入 */
+  function readState() {
+    let raw = null;
+    try {
+      raw = JSON.parse(localStorage.getItem(STORE_KEY));
+    } catch {
+      // 数据损坏（手改 / 被别的页面写脏）：静默重置，用一次 toast 告知
+      queueToast('本地数据读不出来，已重新开始');
+    }
+    return sanitize(raw);
+  }
+
+  /**
+   * 启动时读取，并把洗干净的结果回写一次。
+   * 回写是为了自愈：不管是「JSON 解析失败」还是「JSON 合法但字段脏」，不回写的话
+   * 脏数据会一直躺在 localStorage 里，用户每次刷新都重新踩一遍、每次都弹一次提示。
+   * 注意回写只能发生在启动路径 —— 放进 readState 的话，跨 tab 同步时
+   * 「A 写 → B 读并回写 → A 收到事件再读再回写」会变成无限乒乓。
+   */
+  function load() {
+    const clean = readState();
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(clean)); } catch { /* 存储不可用，交给后续 save() 提示 */ }
+    return clean;
+  }
+
+  let storageBroken = false;
+  function save() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+      storageBroken = false;
+    } catch {
+      // 隐私模式 / 配额满：功能继续可用，只是这次会话结束后不保留
+      if (!storageBroken) {
+        storageBroken = true;
+        toast('浏览器不让存数据，这次改动关掉页面就没了');
+      }
+    }
+  }
+
+  /* ============ 抽取：加权随机 ============ */
+
+  /** 在完整候选集上按 weight 做一次加权抽取 */
+  function weightedDraw(items) {
+    const total = items.reduce((sum, i) => sum + i.weight, 0);
+    let dart = Math.random() * total;
+    for (const item of items) {
+      dart -= item.weight;
+      if (dart < 0) return item;
+    }
+    return items[items.length - 1]; // 浮点误差兜底
+  }
+
+  /**
+   * 抽一个候选。1 个候选时直接返回它。
+   *
+   * 连抽到同一个会让人觉得「坏了」，所以撞上上一次的结果就重抽一次。
+   * 关键是重抽也在**完整池子**上做 —— 早先的实现是先 filter 掉 lastName
+   * 再抽，那等于把 lastName 的权重强行置零：两个候选时会退化成严格交替，
+   * 权重系统完全失效。只重抽一次（不循环）保证必定终止。
+   */
+  function pick(items, lastName) {
+    if (items.length === 0) return null;
+    if (items.length === 1) return items[0];
+
+    const first = weightedDraw(items);
+    return first.name === lastName ? weightedDraw(items) : first;
+  }
+
+  /* ============ 状态 ============ */
+
+  const state = load();
+  let current = null;   // 当前被抽中的 item（打分前一直保持）
+
+  const $ = id => document.getElementById(id);
+  const el = {
+    tabs: $('tabs'),
+    rollBtn: $('rollBtn'),
+    resultName: $('resultName'),
+    hint: $('hint'),
+    rateRow: $('rateRow'),
+    openMenu: $('openMenu')
+  };
+
+  const activeItems = () => state[state.active];
+
+  /* ============ 主屏渲染 ============ */
+
+  function renderStage() {
+    const items = activeItems();
+    const empty = items.length === 0;
+
+    el.rollBtn.disabled = empty;
+    el.rollBtn.textContent = current ? '再来一个' : '随机一个';
+
+    for (const tab of el.tabs.children) {
+      tab.setAttribute('aria-selected', String(tab.dataset.list === state.active));
+    }
+
+    el.resultName.hidden = !current;
+    el.resultName.textContent = current ? current.name : '';
+    el.rateRow.hidden = !current;
+
+    if (empty) {
+      el.hint.textContent = '清单是空的，点右上角 ⚙️ 加几个候选';
+    } else if (current) {
+      el.hint.textContent = '吃完 / 看完再打分';
+    } else {
+      el.hint.textContent = `${LIST_LABEL[state.active]}清单里有 ${items.length} 个候选`;
+    }
+  }
+
+  function roll() {
+    const chosen = pick(activeItems(), current?.name);
+    if (!chosen) return;
+    current = chosen;
+    // 重放入场动画：换个节点让 CSS animation 重新触发
+    el.resultName.style.animation = 'none';
+    void el.resultName.offsetWidth;
+    el.resultName.style.animation = '';
+    renderStage();
+  }
+
+  function rate(verdict) {
+    if (!current) return;
+    const items = activeItems();
+    const index = items.findIndex(i => i.name === current.name);
+
+    if (index !== -1) {
+      if (verdict === 'up') {
+        items[index].weight = clamp(items[index].weight + 1, 1, MAX_WEIGHT);
+        toast(`👍 以后多给你「${items[index].name}」`);
+      } else if (verdict === 'down') {
+        const [removed] = items.splice(index, 1);
+        toast(`👎 已把「${removed.name}」移出清单`);
+      }
+    }
+
+    current = null;   // 回到初始态
+    save();
+    renderStage();
+    renderSheet();
+  }
+
+  function switchList(list) {
+    if (!LISTS.includes(list) || list === state.active) return;
+    state.active = list;
+    current = null;          // 换清单后上一个结果不再有意义
+    save();
+    renderStage();
+    renderSheet();
+  }
+
+  el.rollBtn.addEventListener('click', roll);
+
+  el.rateRow.addEventListener('click', e => {
+    const btn = e.target.closest('.rate');
+    if (btn) rate(btn.dataset.v);
+  });
+
+  el.tabs.addEventListener('click', e => {
+    const tab = e.target.closest('.tab');
+    if (tab) switchList(tab.dataset.list);
+  });
+
+  /* ============ 二级菜单（清单管理） ============ */
+
+  let sheet = null;
+
+  function openSheet() {
+    if (sheet) return;
+
+    const mask = document.createElement('div');
+    mask.className = 'sheet-mask';
+    mask.innerHTML = `
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="清单管理">
+        <div class="sheet-head">
+          <span class="sheet-title"></span>
+          <span class="count"></span>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-act="close" aria-label="关闭">✕</button>
+        </div>
+        <div class="tabs in-sheet" role="tablist">
+          <button class="tab" role="tab" data-list="food">🍜 吃饭</button>
+          <button class="tab" role="tab" data-list="movie">🎬 看电影</button>
+        </div>
+        <form class="adder" data-act="add">
+          <input type="text" maxlength="${MAX_NAME_LEN}" placeholder="加一个候选，回车确认"
+                 enterkeyhint="done" autocomplete="off">
+          <button type="submit">➕</button>
+        </form>
+        <div class="items"></div>
+        <div class="sheet-foot">
+          <button class="danger" data-act="clear">清空所有数据</button>
+        </div>
+      </div>`;
+
+    mask.addEventListener('click', onSheetClick);
+    mask.addEventListener('submit', onAdd);
+    document.body.appendChild(mask);
+    sheet = mask;
+    renderSheet();
+  }
+
+  function closeSheet() {
+    sheet?.remove();
+    sheet = null;
+  }
+
+  function onSheetClick(e) {
+    if (e.target === sheet) return closeSheet();          // 点遮罩关闭
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'close') return closeSheet();
+    if (act === 'clear') return clearAll();
+
+    const tab = e.target.closest('.tab');
+    if (tab) return switchList(tab.dataset.list);
+
+    const del = e.target.closest('.del');
+    if (del) removeItem(Number(del.dataset.i));
+  }
+
+  function onAdd(e) {
+    e.preventDefault();
+    const input = e.target.querySelector('input');
+    const name = input.value.trim().slice(0, MAX_NAME_LEN);
+    if (!name) return;
+
+    const items = activeItems();
+    if (items.length >= MAX_ITEMS) {
+      toast(`一个清单最多 ${MAX_ITEMS} 项`);
+    } else if (items.some(i => i.name === name)) {
+      toast('已经有这个了');
+    } else {
+      items.push({ name, weight: 1 });
+      save();
+      renderStage();
+      renderSheet();
+    }
+    input.value = '';
+    input.focus();
+  }
+
+  function removeItem(index) {
+    const items = activeItems();
+    if (!Number.isInteger(index) || index < 0 || index >= items.length) return;
+    if (current?.name === items[index].name) current = null;
+    items.splice(index, 1);
+    save();
+    renderStage();
+    renderSheet();
+  }
+
+  /**
+   * 重命名走原地更新，不整体重渲染清单。
+   * 重渲染会在 change 事件里销毁事件源那个 input，光标 / 输入法状态一起没；
+   * 拒绝改名时用户本来就想留在原处继续改，更不该把 input 换掉。
+   */
+  function renameItem(index, rawName) {
+    const items = activeItems();
+    const item = items[index];
+    if (!item) return;
+
+    const input = sheet?.querySelector(`.item-name[data-i="${index}"]`);
+    const name = rawName.trim().replace(/\s+/g, ' ').slice(0, MAX_NAME_LEN);
+
+    // 空名 / 撞名 → 放弃修改，把输入框回滚成原值（不动 DOM 结构）
+    if (!name || items.some((other, i) => i !== index && other.name === name)) {
+      if (name) toast('已经有这个了');
+      if (input) input.value = item.name;
+      return;
+    }
+    if (name === item.name) return;
+
+    if (current?.name === item.name) current = { ...current, name };
+    item.name = name;
+
+    if (input) input.value = name;
+    sheet?.querySelector(`.del[data-i="${index}"]`)?.setAttribute('aria-label', `删除 ${name}`);
+
+    save();
+    renderStage();
+  }
+
+  function clearAll() {
+    if (!confirm('清空「吃饭」和「看电影」两个清单的全部数据？此操作不可撤销。')) return;
+    Object.assign(state, emptyState());
+    current = null;
+    try { localStorage.removeItem(STORE_KEY); } catch { /* 存储不可用时内存已清，忽略 */ }
+    save();
+    renderStage();
+    renderSheet();
+    toast('已清空');
+  }
+
+  function renderSheet() {
+    if (!sheet) return;
+    const items = activeItems();
+
+    sheet.querySelector('.sheet-title').textContent = `${LIST_LABEL[state.active]}清单`;
+    sheet.querySelector('.count').textContent = `共 ${items.length} 项`;
+
+    for (const tab of sheet.querySelectorAll('.tabs.in-sheet .tab')) {
+      tab.setAttribute('aria-selected', String(tab.dataset.list === state.active));
+    }
+
+    const box = sheet.querySelector('.items');
+    if (items.length === 0) {
+      box.innerHTML = '<div class="empty-tip">还没有候选，上面加一个吧</div>';
+      return;
+    }
+
+    box.innerHTML = items.map((item, i) => `
+      <div class="item">
+        <input class="item-name" type="text" maxlength="${MAX_NAME_LEN}" data-i="${i}"
+               value="${escapeHtml(item.name)}" aria-label="编辑候选名称" enterkeyhint="done">
+        ${item.weight > 1 ? `<span class="weight">👍×${item.weight - 1}</span>` : ''}
+        <button class="del" data-i="${i}" aria-label="删除 ${escapeHtml(item.name)}">🗑</button>
+      </div>`).join('');
+
+    for (const node of box.querySelectorAll('.item-name')) {
+      node.addEventListener('change', () => renameItem(Number(node.dataset.i), node.value));
+      node.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); node.blur(); }
+      });
+    }
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  el.openMenu.addEventListener('click', openSheet);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
+
+  /* ============ 跨 tab 同步 ============ */
+
+  /**
+   * 同一浏览器开了多个 tab 时，各自的内存 state 会分叉，谁后 save 谁把对方覆盖掉。
+   * storage 事件只在「别的 tab 改了」时触发，收到就以磁盘为准重新载入。
+   * 正在打分的结果（current）保留：它是本 tab 的临时 UI 状态，不属于持久数据；
+   * 若该项已被别的 tab 删掉，则丢弃，避免给一个已经不存在的候选打分。
+   */
+  window.addEventListener('storage', e => {
+    if (e.key !== STORE_KEY) return;
+    const incoming = readState();
+    incoming.active = state.active;   // 当前看的是哪个清单是本 tab 的事，别被对方拽走
+    Object.assign(state, incoming);
+    if (current && !activeItems().some(i => i.name === current.name)) current = null;
+    renderStage();
+    renderSheet();
+    flushPendingToast();
+  });
+
+  /* ============ toast ============ */
+
+  let toastNode = null, toastTimer = 0;
+
+  function toast(msg) {
+    toastNode?.remove();
+    clearTimeout(toastTimer);
+    toastNode = document.createElement('div');
+    toastNode.className = 'toast';
+    toastNode.setAttribute('role', 'status');
+    toastNode.textContent = msg;
+    document.body.appendChild(toastNode);
+    toastTimer = setTimeout(() => { toastNode?.remove(); toastNode = null; }, 2200);
+  }
+
+  /* ============ 启动 ============ */
+
+  renderStage();
+  flushPendingToast();
+})();
+</script>
+</body>
+</html>
